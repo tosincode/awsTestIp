@@ -7,7 +7,7 @@ const swaggerJSDoc = require("swagger-jsdoc");
 
 const app = express();
 
-// IMPORTANT: behind DigitalOcean/NGINX, this helps req.ip + protocol behave correctly
+// Important behind DigitalOcean/NGINX so req.ip + x-forwarded-for work as expected
 app.set("trust proxy", 1);
 
 const AWS_BASE_URL =
@@ -33,6 +33,11 @@ function getClientIp(req) {
   return req.ip || req.socket?.remoteAddress || "";
 }
 
+function shortUa(ua) {
+  if (!ua) return "";
+  return String(ua).slice(0, 120);
+}
+
 // ---------- request logging middleware ----------
 app.use((req, res, next) => {
   const requestId = crypto.randomUUID
@@ -41,11 +46,13 @@ app.use((req, res, next) => {
 
   const startedAt = Date.now();
   const clientIp = getClientIp(req);
+  const ua = shortUa(req.headers["user-agent"]);
 
   req.requestId = requestId;
 
+  // This line will show in DigitalOcean Runtime Logs
   console.log(
-    `[${requestId}] --> ${req.method} ${req.originalUrl} | clientIp=${clientIp}`
+    `[${requestId}] --> ${req.method} ${req.originalUrl} | callerIp=${clientIp} | ua=${ua}`
   );
 
   res.on("finish", () => {
@@ -66,16 +73,15 @@ const swaggerSpec = swaggerJSDoc({
       title: "Outbound IP Service",
       version: "1.0.0",
       description:
-        "Tiny service that resolves the public IP for an AWS EC2 public DNS / base URL.",
+        "Tiny service that resolves AWS public IP and logs the caller IP for inbound requests.",
     },
+    // Relative server so Swagger uses current host (works on DO + locally)
     servers: [{ url: "/" }],
   },
   apis: [__filename],
 });
 
 app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
-
-// raw spec
 app.get("/openapi.json", (req, res) => res.json(swaggerSpec));
 
 // ---------- routes ----------
@@ -104,7 +110,7 @@ app.get("/openapi.json", (req, res) => res.json(swaggerSpec));
  *                   example: ip address
  *                 hostname:
  *                   type: string
- *                   example: hostname
+ *                   example: url hostname
  *       500:
  *         description: Failed to resolve IP
  */
@@ -116,7 +122,7 @@ app.get("/aws-public-ip", async (req, res) => {
     const hostname = url.hostname;
 
     console.log(
-      `[${requestId}] Resolving hostname via DNS | hostname=${hostname} | AWS_BASE_URL=${AWS_BASE_URL}`
+      `[${requestId}] Resolving AWS hostname via DNS | hostname=${hostname} | AWS_BASE_URL=${AWS_BASE_URL}`
     );
 
     const lookup = await dns.lookup(hostname, { family: 4 });
@@ -128,7 +134,6 @@ app.get("/aws-public-ip", async (req, res) => {
           lookup
         )}`
       );
-
       return res.status(502).json({
         ok: false,
         error: "DNS lookup did not return a valid IPv4 address",
@@ -137,8 +142,7 @@ app.get("/aws-public-ip", async (req, res) => {
       });
     }
 
-    // This is the log you want to see in DigitalOcean Runtime Logs
-    console.log(`[${requestId}] Resolved IP OK | hostname=${hostname} | ip=${ip}`);
+    console.log(`[${requestId}] Resolved AWS IP OK | hostname=${hostname} | ip=${ip}`);
 
     return res.json({
       ok: true,
@@ -147,14 +151,64 @@ app.get("/aws-public-ip", async (req, res) => {
       hostname,
     });
   } catch (err) {
-    console.log(`[${requestId}] Error resolving IP | message=${err.message}`);
-
+    console.log(`[${requestId}] Error resolving AWS IP | message=${err.message}`);
     return res.status(500).json({
       ok: false,
       error: "Failed to determine AWS public IP",
       message: err.message,
     });
   }
+});
+
+/**
+ * @swagger
+ * /client-ip:
+ *   get:
+ *     summary: Get the IP address of the caller (another service hitting this app)
+ *     description: >
+ *       Returns the best-effort caller IP using x-forwarded-for (if present) and req.ip.
+ *       Logs callerIp to Runtime Logs.
+ *     responses:
+ *       200:
+ *         description: Caller IP returned successfully
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                   example: true
+ *                 callerIp:
+ *                   type: string
+ *                   example: 203.0.113.10
+ *                 forwardedFor:
+ *                   type: string
+ *                   example: "203.0.113.10, 10.0.0.1"
+ *                 userAgent:
+ *                   type: string
+ *                   example: "curl/8.0.1"
+ *                 requestId:
+ *                   type: string
+ *                   example: "a1b2c3d4"
+ */
+app.get("/client-ip", async (req, res) => {
+  const requestId = req.requestId || "no-request-id";
+  const callerIp = getClientIp(req);
+
+  // Explicit log so you can spot it easily in Runtime Logs
+  console.log(
+    `[${requestId}] /client-ip called | callerIp=${callerIp} | x-forwarded-for=${req.headers["x-forwarded-for"] || ""
+    }`
+  );
+
+  return res.json({
+    ok: true,
+    callerIp,
+    forwardedFor: req.headers["x-forwarded-for"] || null,
+    userAgent: req.headers["user-agent"] || null,
+    requestId,
+  });
 });
 
 app.listen(PORT, () => {
