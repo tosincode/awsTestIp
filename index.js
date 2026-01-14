@@ -19,13 +19,6 @@ function isIPv4(ip) {
   return ipv4.test(ip);
 }
 
-function ipFromEc2Hostname(hostname) {
-  const m = hostname.match(/^ec2-(\d+)-(\d+)-(\d+)-(\d+)\./);
-  if (!m) return null;
-  const ip = `${m[1]}.${m[2]}.${m[3]}.${m[4]}`;
-  return isIPv4(ip) ? ip : null;
-}
-
 // ---------- Swagger ----------
 const swaggerSpec = swaggerJSDoc({
   definition: {
@@ -36,10 +29,9 @@ const swaggerSpec = swaggerJSDoc({
       description:
         "Tiny service that resolves the public IP for an AWS EC2 public DNS / base URL.",
     },
-    // IMPORTANT: relative server so Swagger uses current host in dev/prod
-    servers: [{ url: "/" }],
+    servers: [{ url: "/" }], // works locally + in prod
   },
-  apis: [__filename], // reads JSDoc from this file
+  apis: [__filename],
 });
 
 app.use("/docs", swaggerUi.serve, swaggerUi.setup(swaggerSpec));
@@ -53,9 +45,7 @@ app.get("/openapi.json", (req, res) => res.json(swaggerSpec));
  * /aws-public-ip:
  *   get:
  *     summary: Resolve the public IPv4 for the configured AWS base URL
- *     description: >
- *       First tries to parse the IPv4 from EC2 public DNS names like ec2-34-202-126-158.compute-1.amazonaws.com.
- *       If that fails, falls back to DNS lookup.
+ *     description: Resolves the hostname via DNS lookup and returns the A record IPv4 address.
  *     responses:
  *       200:
  *         description: Public IP resolved successfully
@@ -69,13 +59,13 @@ app.get("/openapi.json", (req, res) => res.json(swaggerSpec));
  *                   example: true
  *                 method:
  *                   type: string
- *                   example: parsed-from-hostname
+ *                   example: dns-lookup
  *                 ip:
  *                   type: string
- *                   example: 34.202.126.158
+ *                   example: my public IPv4 address
  *                 hostname:
  *                   type: string
- *                   example: ec2-34-202-126-158.compute-1.amazonaws.com
+ *                   example: url hostname
  *       500:
  *         description: Failed to resolve IP
  *         content:
@@ -98,23 +88,22 @@ app.get("/aws-public-ip", async (req, res) => {
     const url = new URL(AWS_BASE_URL);
     const hostname = url.hostname;
 
-    // 1) Parse IP from EC2-style hostname
-    const parsed = ipFromEc2Hostname(hostname);
-    if (parsed) {
-      return res.json({
-        ok: true,
-        method: "parsed-from-hostname",
-        ip: parsed,
+    const lookup = await dns.lookup(hostname, { family: 4 });
+    const ip = lookup.address;
+
+    if (!isIPv4(ip)) {
+      return res.status(502).json({
+        ok: false,
+        error: "DNS lookup did not return a valid IPv4 address",
         hostname,
+        raw: lookup,
       });
     }
 
-    // 2) Fallback: DNS lookup
-    const lookup = await dns.lookup(hostname, { family: 4 });
     return res.json({
       ok: true,
       method: "dns-lookup",
-      ip: lookup.address,
+      ip,
       hostname,
     });
   } catch (err) {
@@ -127,6 +116,6 @@ app.get("/aws-public-ip", async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Running on http://localhost:${PORT}`);
-  console.log(`Swagger UI: http://localhost:${PORT}/docs`);
+  console.log(`Server listening on port ${PORT}`);
+  console.log(`Swagger UI available at /docs`);
 });
